@@ -411,6 +411,7 @@ class AIAgent:
         pass_session_id: bool = False,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
+        # 中文·初始化转交 init_agent：memory 状态（_memory_store/_memory_manager）由它接线并赋到 self
         from agent.agent_init import init_agent
         init_agent(
             self,
@@ -1415,6 +1416,10 @@ class AIAgent:
         here so existing tests that patch ``run_agent.threading.Thread``
         keep working.
         """
+        # 中文·后台审查线程：拿对话快照在独立守护线程里跑"记忆/技能复盘"。
+        # review_memory=True 时会基于本轮对话沉淀长期记忆（写 MEMORY.md/USER.md 等），
+        # 与主流程异步解耦，不阻塞用户当前回答；这里仅负责建线程并启动，复盘逻辑在
+        # background_review.spawn_background_review_thread 返回的 target 里。
         from agent.background_review import spawn_background_review_thread
         target, _prompt = spawn_background_review_thread(
             self,
@@ -1434,6 +1439,10 @@ class AIAgent:
         tool_call_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.background_review.build_memory_write_metadata``."""
+        # 中文·组装记忆写入的元数据：标注这条记忆是谁、在什么上下文写的
+        # （write_origin 来源、execution_context 执行场景、task_id/tool_call_id 关联），
+        # 供 _memory_manager.on_memory_write 把内置 memory 写入镜像同步给外部 provider 时携带，
+        # 便于后端按来源做去重/溯源/作用域隔离。
         from agent.background_review import build_memory_write_metadata
         return build_memory_write_metadata(
             self,
@@ -2886,6 +2895,10 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        # 中文·会话级收尾（仅在真正的会话边界调用，非每轮）：
+        # 先 on_session_end 触发外部 provider 做收尾抽取（把整段对话沉淀为长期记忆），
+        # 再 shutdown_all 释放 provider 资源（连接/线程/句柄）；两步都吞异常，
+        # 避免记忆后端故障影响正常退出。
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
@@ -2964,6 +2977,9 @@ class AIAgent:
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
+        # 中文·每轮结束的外部记忆写回锚点：sync_all 持久化本轮交流 + queue_prefetch_all
+        # 预热下一轮召回。interrupted 轮整段跳过（半截输出不是对话真相，#15218）；
+        # 全程 try/except 吞异常——外部 provider 离线/配置错也绝不阻塞用户看到回复。
         if interrupted:
             return
         if not (self._memory_manager and final_response and original_user_message):

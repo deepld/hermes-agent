@@ -306,6 +306,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 
+    # 中文·把记忆装进 system prompt：内置取【冻结快照】（format_for_system_prompt 返回的是
+    # load 时的快照，非活状态，故 session 内字节稳定）；外部 provider 的静态块附加在后。
+    # 真正的"召回内容"不在这里，而是每轮在 conversation_loop 里 ephemeral 注入到 user 消息。
     if agent._memory_store:
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")
@@ -318,6 +321,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 volatile_parts.append(user_block)
 
     # External memory provider system prompt block (additive to built-in)
+    # 中文：外部 memory provider 的静态 system 块（追加在内置冻结快照之后）。
     if agent._memory_manager:
         try:
             _ext_mem_block = agent._memory_manager.build_system_prompt()
@@ -375,6 +379,8 @@ def invalidate_system_prompt(agent: Any) -> None:
     Called after context compression events. Also reloads memory from disk
     so the rebuilt prompt captures any writes from this session.
     """
+    # 中文：压缩后作废缓存的 system prompt；并 load_from_disk 重读磁盘，
+    # 让下次重建时重新冻结一份包含本会话写入的 memory 快照。
     agent._cached_system_prompt = None
     if agent._memory_store:
         agent._memory_store.load_from_disk()

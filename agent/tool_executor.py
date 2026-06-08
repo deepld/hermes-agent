@@ -862,6 +862,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             pass
         # Reset nudge counters when the relevant tool is actually used
         elif function_name == "memory":
+            # 中文·memory 工具真正被调用时，把"距上次写记忆的轮数"清零，避免后续重复 nudge 提醒
             agent._turns_since_memory = 0
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
@@ -1010,6 +1011,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
         elif function_name == "memory":
+            # 中文·内置 memory 工具的 dispatch 入口：LLM 调 memory(action/target/content)
+            # 落到这里 → 转发给 tools/memory_tool.py 做确定性校验+落盘；若挂了外部 provider，
+            # 再调 _memory_manager.on_memory_write 把这条写入镜像同步过去（仅 add/replace）。
             def _execute(next_args: dict) -> Any:
                 target = next_args.get("target", "memory")
                 from tools.memory_tool import memory_tool as _memory_tool
@@ -1020,6 +1024,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     old_text=next_args.get("old_text"),
                     store=agent._memory_store,
                 )
+                # 中文·镜像桥（仅 add/replace）：内置 memory 工具写完后，把这条写入"镜像"
+                # 同步给外部 provider（honcho/mem0…），让两套记忆保持一致；remove 不镜像
+                # （删除不向 provider 引入新内容）。镜像失败被吞掉，不影响已落盘的内置写入。
                 # Bridge: notify external memory provider of built-in memory writes
                 if agent._memory_manager and next_args.get("action") in {"add", "replace"}:
                     try:
@@ -1138,6 +1145,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
             # Memory provider tools (hindsight_retain, honcho_search, etc.)
             # These are not in the tool registry — route through MemoryManager.
+            # 中文·外部 provider 自带工具（如 honcho_*/mem0_*）不在内置注册表里，
+            # 经 _memory_manager 的路由表分发到对应后端执行。
             spinner = None
             if agent._should_emit_quiet_tool_messages() and agent._should_start_quiet_spinner():
                 face = random.choice(KawaiiSpinner.get_waiting_faces())
@@ -1148,6 +1157,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _mem_result = None
             try:
                 def _execute(next_args: dict) -> Any:
+                    # 中文·把这次工具调用交给 provider 的 handle_tool_call，由它选中对应后端实现
                     return agent._memory_manager.handle_tool_call(function_name, next_args)
                 function_result, function_args = _run_agent_tool_execution_middleware(
                     agent,

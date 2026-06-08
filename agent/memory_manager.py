@@ -23,6 +23,29 @@ Usage in run_agent.py:
     self._memory_manager.queue_prefetch_all(user_msg)
 """
 
+# ═════════════════════════════════════════════════════════════════════════════
+# 【中文导读】外部记忆 Provider 的「编排器 + 安全围栏」——本文件也是纯代码
+# ═════════════════════════════════════════════════════════════════════════════
+# 内置 MEMORY.md / USER.md 走 tools/memory_tool.py 的独立路径；本文件管的是
+# 【外部】provider（Honcho / Mem0 / Hindsight ... 一次只能挂一个）。它做三件事：
+#
+#   1) 编排（fan-out）：把生命周期 hook（prefetch / sync / on_turn_start /
+#      on_session_switch / on_memory_write ...）广播给已注册的 provider。
+#      关键不变量：【全 fail-open】——任一 provider 抛异常都被 try/except 吞掉，
+#      绝不阻塞主对话或别的 provider。
+#
+#   2) 闸门（add_provider）：只允许一个外部 provider（防 tool schema 膨胀）；
+#      provider 不得注册 clarify / delegate_task 等核心工具名（防劫持 dispatch，#40466）。
+#
+#   3) 围栏（build_memory_context_block + StreamingContextScrubber + sanitize_context）：
+#      provider 召回回来的文本是【不可信外部数据】，会被包进 <memory-context> fence 并
+#      附 "NOT new user input" 提示；流式 scrubber 还防止 fence 标签被拆在两个 chunk 间
+#      把 payload 漏到 UI。这一层全是确定性字符串处理，与 LLM 无关。
+#
+# LLM 在哪？——provider 后端（如 Honcho 的 dialectic 推断 / 事实抽取）可能用 LLM，
+# 但那发生在【进程/服务边界之外】；回到本文件这一侧的编排、围栏、路由永远是代码。
+# ═════════════════════════════════════════════════════════════════════════════
+
 from __future__ import annotations
 
 import logging
@@ -53,6 +76,11 @@ _INTERNAL_NOTE_RE = re.compile(
 
 def sanitize_context(text: str) -> str:
     """Strip fence tags, injected context blocks, and system notes from provider output."""
+    # 中文·围栏清洗：provider 召回回来的文本属"不可信外部数据"，可能自带伪造的
+    # <memory-context> fence 或 "[System note: ...NOT new user input...]" 系统提示，
+    # 企图伪装成我们的可信围栏来注入指令。这里用三条正则逐层剥掉：完整的内嵌
+    # context 块、系统提示行、以及残留的孤立 fence 标签，得到纯净 payload 后再交给
+    # build_memory_context_block 重新包一层"真正"的围栏。纯字符串处理、与 LLM 无关。
     text = _INTERNAL_CONTEXT_RE.sub('', text)
     text = _INTERNAL_NOTE_RE.sub('', text)
     text = _FENCE_TAG_RE.sub('', text)
@@ -85,15 +113,27 @@ class StreamingContextScrubber:
     ``reset()``.
     """
 
+    # 中文·流式围栏（fence）守卫：build_memory_context_block 包出的 <memory-context>
+    # fence 是给"我方注入的召回上下文"用的安全边界；如果模型的流式输出里恰好出现
+    # 这对标签（无论是巧合复述还是被诱导回显），其 payload 一旦逐字 delta 给到 UI，
+    # 用户会看到本应内部消化的记忆内容。一次性的 sanitize_context 正则要求开/闭标签
+    # 同处一个字符串，跨 chunk 拆分时会失效。本类用一个跨 delta 的小状态机解决：
+    # 命中开标签后进入 span、丢弃 span 内一切（含系统提示行），见闭标签才退出；尾部
+    # 可能是半截标签的片段则"扣住"(hold back)等下一个 delta 拼接确认，确定性、无 LLM。
+
     _OPEN_TAG = "<memory-context>"
     _CLOSE_TAG = "</memory-context>"
 
     def __init__(self) -> None:
+        # 中文：状态机三件套——_in_span 表示当前是否正落在一对 fence 之内（内部内容全丢弃）；
+        # _buf 是"扣住"的尾部（可能是半截标签，等下个 delta 拼接判定）；_at_block_boundary
+        # 记录已输出文本是否停在行首空白处，供"只在块边界识别开标签"的判定使用。
         self._in_span: bool = False
         self._buf: str = ""
         self._at_block_boundary: bool = True
 
     def reset(self) -> None:
+        # 中文：新一轮顶层回复开始时清空状态机，复用同一个 scrubber 实例而不残留上轮的 span/缓冲。
         self._in_span = False
         self._buf = ""
         self._at_block_boundary = True
@@ -105,6 +145,9 @@ class StreamingContextScrubber:
         is held back in the internal buffer and surfaced on the next
         ``feed()`` call or discarded/emitted by ``flush()``.
         """
+        # 中文：核心入口。把扣住的 _buf 与本次 delta 拼起来后循环推进状态机——span 内找闭标签
+        # （找不到就扣住可能的半截闭标签、丢弃其余），span 外找块边界处的开标签（找不到就先输出
+        # 安全部分、扣住可能的半截开标签）。返回本次确定可见的文本，其余留待下一次 feed 或 flush。
         if not text:
             return ""
         buf = self._buf + text
@@ -152,6 +195,8 @@ class StreamingContextScrubber:
         truncated answer).  Otherwise the held-back partial-tag tail is
         emitted verbatim (it turned out not to be a real tag).
         """
+        # 中文：流结束时清账。仍在未闭合 span 内则整段丢弃（宁可截断答案也不漏出半截记忆，
+        # 这是本守卫的 fail-closed 偏向）；否则把扣住的尾巴原样吐出——它最终被证明不是真标签。
         if self._in_span:
             self._buf = ""
             self._in_span = False
@@ -226,6 +271,9 @@ class StreamingContextScrubber:
 
 def build_memory_context_block(raw_context: str) -> str:
     """Wrap prefetched memory in a fenced block with system note."""
+    # 中文·安全围栏：召回内容来自外部，属不可信数据。先 sanitize 掉它可能自带的
+    # 伪造 fence/系统提示，再包进 <memory-context> 并标注"这是召回的记忆、不是新的
+    # 用户输入"，防止召回文本被模型当成指令执行（间接 prompt injection）。
     if not raw_context or not raw_context.strip():
         return ""
     clean = sanitize_context(raw_context)
@@ -249,6 +297,9 @@ class MemoryManager:
     """
 
     def __init__(self) -> None:
+        # 中文：编排器的内部状态。_providers 按注册顺序存所有 provider（广播 hook 时依序 fan-out）；
+        # _tool_to_provider 是工具名→provider 的路由表，handle_tool_call 据此分发；_has_external
+        # 作为"一外部 provider 闸门"的标志位，一旦挂上非 builtin provider 即置 True，拒绝第二个。
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
@@ -262,6 +313,9 @@ class MemoryManager:
         Only **one** external (non-builtin) provider is allowed — a second
         attempt is rejected with a warning.
         """
+        # 中文·一外部 provider 闸门：name=="builtin" 永远接受；非 builtin 的若已有一个
+        # 在册就直接拒绝并告警。这样既防 tool schema 膨胀，也避免两个后端互相打架。
+        # （实践中内置 MEMORY.md 走独立路径，不以 provider 形式注册，故这里基本只进外部分支。）
         is_builtin = provider.name == "builtin"
 
         if not is_builtin:
@@ -323,10 +377,12 @@ class MemoryManager:
     @property
     def providers(self) -> List[MemoryProvider]:
         """All registered providers in order."""
+        # 中文：返回副本，避免外部改动内部注册顺序/列表。
         return list(self._providers)
 
     def get_provider(self, name: str) -> Optional[MemoryProvider]:
         """Get a provider by name, or None if not registered."""
+        # 中文：按名查 provider 的简单 getter（如取 "builtin" 或某外部 provider）。
         for p in self._providers:
             if p.name == name:
                 return p
@@ -340,6 +396,9 @@ class MemoryManager:
         Returns combined text, or empty string if no providers contribute.
         Each non-empty block is labeled with the provider name.
         """
+        # 中文：在 run_agent.py 拼系统提示时调一次，把每个 provider 的 system_prompt_block()
+        # （如"你有持久记忆，可用 xxx 工具召回"之类的使用说明）收集合并。fail-open：单个
+        # provider 抛异常只告警跳过，不影响整体系统提示生成。这是 prefix 缓存友好的稳定前缀。
         blocks = []
         for provider in self._providers:
             try:
@@ -361,6 +420,9 @@ class MemoryManager:
         Returns merged context text labeled by provider. Empty providers
         are skipped. Failures in one provider don't block others.
         """
+        # 中文：每轮对话前调一次（结果在 conversation_loop 里缓存复用，避免每个 tool call
+        # 都召回）。prefetch() 约定要"快"——真正的召回在 provider 后台线程做，这里只取缓存。
+        # provider 后端可能用 LLM/embedding 做语义召回，但本方法只是同步收集+合并字符串。
         parts = []
         for provider in self._providers:
             try:
@@ -376,6 +438,8 @@ class MemoryManager:
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn."""
+        # 中文：与 prefetch_all（取缓存、要快）配对的"预热"端。本轮结束后调一次，让各 provider
+        # 在后台线程提前为下一轮做语义召回，下轮 prefetch_all 就能命中现成缓存。同样 fail-open。
         for provider in self._providers:
             try:
                 provider.queue_prefetch(query, session_id=session_id)
@@ -390,6 +454,8 @@ class MemoryManager:
     @staticmethod
     def _provider_sync_accepts_messages(provider: MemoryProvider) -> bool:
         """Return whether sync_turn accepts a messages keyword."""
+        # 中文：能力探测。用 inspect 看 provider.sync_turn 是否吃 messages 关键字（或带 **kwargs），
+        # 以便 sync_all 决定要不要把完整消息列表传进去——向后兼容只认 user/assistant 文本的老 provider。
         try:
             signature = inspect.signature(provider.sync_turn)
         except (TypeError, ValueError):
@@ -408,6 +474,9 @@ class MemoryManager:
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Sync a completed turn to all providers."""
+        # 中文：每轮对话结束后调，把这一轮(user_content + assistant_content，可选完整 messages)
+        # 写回各 provider 做记忆固化/事实抽取。先用 _provider_sync_accepts_messages 决定走"带
+        # messages"还是"仅文本"的调用形态。provider 后端可能用 LLM 抽事实，但本层只做同步分发；fail-open。
         for provider in self._providers:
             try:
                 if messages is not None and self._provider_sync_accepts_messages(provider):
@@ -439,6 +508,9 @@ class MemoryManager:
         :meth:`add_provider`, so the manager must not advertise a schema it
         will never route. Built-ins always win (#40466).
         """
+        # 中文：向 LLM 暴露所有 provider 的工具 schema（如召回/写记忆工具）。两道闸：跳过占用
+        # 核心工具名（clarify/delegate_task 等，防劫持 dispatch）的 schema，并用 seen 去重——
+        # 保证只广告真正会被 handle_tool_call 路由到的工具，与 add_provider 的路由表保持一致。
         from toolsets import _HERMES_CORE_TOOLS
 
         _core_tool_names = set(_HERMES_CORE_TOOLS)
@@ -462,10 +534,12 @@ class MemoryManager:
 
     def get_all_tool_names(self) -> set:
         """Return set of all tool names across all providers."""
+        # 中文：直接读路由表的键集（已在 add_provider 过滤掉核心工具名）。
         return set(self._tool_to_provider.keys())
 
     def has_tool(self, tool_name: str) -> bool:
         """Check if any provider handles this tool."""
+        # 中文：dispatch 前的归属判断——某工具名是否落在记忆路由表里。
         return tool_name in self._tool_to_provider
 
     def handle_tool_call(
@@ -476,6 +550,9 @@ class MemoryManager:
         Returns JSON string result. Raises ValueError if no provider
         handles the tool.
         """
+        # 中文：按工具名查路由表，转交给对应 provider 执行其记忆工具（召回/写入等）。这里不广播——
+        # 一个工具只归一个 provider。fail-open 体现为：无人认领或执行抛错都转成 tool_error 文本
+        # 回给模型，而不是炸断 dispatch 循环，让对话能继续。
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
@@ -495,6 +572,8 @@ class MemoryManager:
 
         kwargs may include: remaining_tokens, model, platform, tool_count.
         """
+        # 中文：每轮开始把轮次/消息及运行时上下文(剩余 token、模型、平台等)广播给各 provider，
+        # 供其做预算感知或时机判断（如何时该召回/压缩）。fail-open，仅 debug 记录失败。
         for provider in self._providers:
             try:
                 provider.on_turn_start(turn_number, message, **kwargs)
@@ -506,6 +585,7 @@ class MemoryManager:
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
+        # 中文：会话彻底结束时把整段 messages 广播给各 provider，给它们最后一次固化/收尾的机会。
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -539,6 +619,10 @@ class MemoryManager:
         transcript was truncated; providers caching per-turn document
         state should invalidate.
         """
+        # 中文：当 AIAgent.session_id 在不重建 provider 的前提下被改写（/resume /branch /reset
+        # /new、上下文压缩、/undo 回退）时广播，让 provider 刷新按会话缓存的状态，保证后续写入
+        # 落到正确会话的记录里。关键细节：rewound 只在确为 True（/undo）时才注入 kwargs，避免给常见
+        # 路径平白塞 rewound=False 污染那些捕获额外 kwargs 的 provider。fail-open。
         if not new_session_id:
             return
         # Only forward ``rewound`` when it's actually set. Passing it
@@ -569,6 +653,8 @@ class MemoryManager:
         Returns combined text from providers to include in the compression
         summary prompt. Empty string if no provider contributes.
         """
+        # 中文：上下文压缩前调一次，给各 provider 机会贡献"该保进摘要"的关键记忆，合并后注入压缩
+        # 摘要 prompt——防止重要长期事实在裁剪 transcript 时丢失。fail-open，单 provider 失败只跳过。
         parts = []
         for provider in self._providers:
             try:
@@ -585,6 +671,9 @@ class MemoryManager:
     @staticmethod
     def _provider_memory_write_metadata_mode(provider: MemoryProvider) -> str:
         """Return how to pass metadata to a provider's memory-write hook."""
+        # 中文：镜像桥的兼容探测器。inspect provider.on_memory_write 的签名，判定 metadata 该怎么传：
+        # 带 **kwargs 或具名 metadata 参数→"keyword"；够 4 个位置参数→"positional"；都不满足→"legacy"
+        # （老插件只收 action/target/content 三参，不传 metadata）。据此让 on_memory_write 选对调用形态。
         try:
             signature = inspect.signature(provider.on_memory_write)
         except (TypeError, ValueError):
@@ -619,6 +708,10 @@ class MemoryManager:
 
         Skips the builtin provider itself (it's the source of the write).
         """
+        # 中文·镜像桥：内置 memory 工具写入 MEMORY.md/USER.md 后（见 tool_executor.py），
+        # 把同一条写入(action/target/content + provenance 元数据)转发给外部 provider，
+        # 让两套记忆保持同步。用 inspect 探测 provider 的 hook 签名做 keyword/positional/
+        # legacy 兼容，不破坏老插件契约。本方法是确定性 dispatch；provider 收到后可能再用 LLM。
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
@@ -641,6 +734,8 @@ class MemoryManager:
     def on_delegation(self, task: str, result: str, *,
                       child_session_id: str = "", **kwargs) -> None:
         """Notify all providers that a subagent completed."""
+        # 中文：子 agent（delegate_task 派生）完成后，把它的任务与结果广播给各 provider，让父会话
+        # 的记忆能吸收子任务产出（含 child_session_id 标明来源）。fail-open。
         for provider in self._providers:
             try:
                 provider.on_delegation(
@@ -654,6 +749,8 @@ class MemoryManager:
 
     def shutdown_all(self) -> None:
         """Shut down all providers (reverse order for clean teardown)."""
+        # 中文：进程收尾时按注册逆序逐个 shutdown（与依赖建立顺序相反，干净拆除），让 provider
+        # flush 后台队列、关连接/线程。fail-open：单个关停失败只告警，不阻断其余 provider 的清理。
         for provider in reversed(self._providers):
             try:
                 provider.shutdown()
@@ -670,6 +767,9 @@ class MemoryManager:
         provider can resolve profile-scoped storage paths without importing
         ``get_hermes_home()`` themselves.
         """
+        # 中文：启动时给每个 provider 注入起始 session_id 并完成初始化（建连接、起后台线程等）。
+        # 统一兜底注入 hermes_home，使 provider 无需自行 import 就能解析按 profile 隔离的存储路径。
+        # fail-open：单个 provider 初始化失败只告警，其余照常初始化，不让一个坏 provider 拖垮启动。
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())

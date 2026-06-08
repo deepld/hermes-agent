@@ -389,6 +389,45 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    # ═════════════════════════════════════════════════════════════════════════
+    # 【中文导读】run_conversation —— 处理「一整轮」对话的主干（⚙️ 夹 🤖）
+    # ═════════════════════════════════════════════════════════════════════════
+    # 本函数 = 一条用户消息的完整生命周期：用户消息进 → 模型推理 + 工具循环 → 最终
+    # 回复出。每条用户消息调用一次（由 CLI / gateway 的消息入口驱动）。
+    #
+    # 命名澄清：这里的 "conversation" 指【一整轮】的处理，而不是「整段会话」——整段
+    # 会话是 session（跨多轮、持久存在 DB）。三个易混层级：iteration（工具循环单步）
+    # ⊂ turn（一次本函数调用）⊂ session（持久对话线）。
+    #
+    # 一轮的执行顺序（阶段编号对应下方各 banner 注释）：
+    #   ① 预备/接线   : 安全 stdio、DB session、runtime_main、日志上下文、write-origin、
+    #                   恢复主 runtime、surrogate 清洗、task_id/turn_id、复位重试计数与预算。
+    #   ② 水合/节流   : 从 history 重建 nudge 计数（gateway 每轮新建 agent → 计数从 0 起，
+    #                   靠 history 续命）；_user_turn_count++；判定本轮是否触发后台记忆审查
+    #                   （每 N 轮，默认 10）。
+    #   ③ system prompt: 首轮或 DB 存档损坏才真正 build，否则复用上轮存的（保 prefix 缓存）。
+    #   ④ 外部召回    : on_turn_start 通知 provider 新一轮；prefetch_all 取一次召回缓存
+    #                   （每轮一次、延迟一轮注入到 user 消息副本）。
+    #   ⑤ 工具循环    : while 主循环——每次迭代 = 一次模型 API 调用 + 工具分发；受
+    #                   max_iterations / iteration_budget 限；内含中断、/steer 引流、
+    #                   skill nudge 计数；模型给出最终回复即跳出。
+    #   ⑥ 收尾        : 同步本轮进外部 memory + 预约下轮召回；若 nudge 命中且有最终回复
+    #                   且未被中断 → fork 后台 LLM 审查（异步、尽力而为）；触发
+    #                   on_session_end hook；返回 result。
+    #
+    # 边界：「该不该记 / 记什么」由 ⑤ 里的模型与 ⑥ fork 的 review agent（🤖）决定；
+    # 计数、节流、注入、同步、落盘全是确定性代码（⚙️）。
+    # ═════════════════════════════════════════════════════════════════════════
+    # 中文·【阶段① 预备/接线】进主流程前的确定性准备，逐项：
+    #   · _install_safe_stdio()         安全 stdio，防 broken pipe 写崩溃（daemon/headless）
+    #   · _ensure_db_session()          确保本 session 的 DB 行存在
+    #   · set_runtime_main(...)         把本轮真实 provider/model/base_url 告知 auxiliary_client
+    #   · set_session_context(id)       给本线程日志打 session 标签（便于 hermes logs 过滤）
+    #   · set_current_write_origin(...) 标记写来源（前台 user turn vs 后台 review fork）
+    #   · _restore_primary_runtime()    上轮若触发 fallback，本轮恢复首选模型重试
+    #   · _sanitize_surrogates(...)     清洗用户输入里的孤代理字符（防 JSON 序列化崩溃）
+    #   · effective_task_id / turn_id   生成隔离 id（并发 VM 隔离 + 日志关联）
+    #   · 复位本轮重试计数 / guardrails / 新建 iteration_budget；清死 TCP 连接；补播压缩告警
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     # Installed once, transparent when streams are healthy, prevents crash on write.
     _install_safe_stdio()
@@ -508,6 +547,14 @@ def run_conversation(
         _msg_preview,
     )
 
+    # 中文·【阶段② 水合/节流】本轮的状态恢复与节奏判定，逐项（下面到 nudge 判定为止）：
+    #   · messages = list(history)      拷贝调用方 history（避免就地修改它）
+    #   · _hydrate_todo_store           gateway 新建 agent → 从 history 最近 todo 响应恢复 todo 态
+    #   · nudge 计数水合               见下方注释（计数从 0 起，靠 history 用户轮次 % N 续命）
+    #   · _user_turn_count += 1         本轮用户轮次计入
+    #   · scrubber/think_scrubber.reset 清掉上次被打断的流式残留 span，防污染本轮输出
+    #   · original_user_message         保留干净用户消息（不含召回/插件注入）供日志与 provider 查询
+    #   · _should_review_memory 判定    _turns_since_memory+1，到 N 置位（本轮末再 spawn 后台审查）
     # Initialize conversation (copy to avoid mutating the caller's list)
     messages = list(conversation_history) if conversation_history else []
 
@@ -517,6 +564,8 @@ def run_conversation(
     if conversation_history and not agent._todo_store.has_items():
         agent._hydrate_todo_store(conversation_history)
 
+    # 中文·【阶段② 水合/节流】下面这段重建 nudge 计数：gateway 每轮新建 AIAgent，计数器从
+    # 0 起，靠从 history 数历史用户轮次 % N 续命，保持「每 N 轮触发一次」的 session 级节奏。
     # Hydrate per-session nudge counters from persisted history.
     # Gateway creates a fresh AIAgent per inbound message (cache miss /
     # 1h idle eviction / config-signature mismatch / process restart), so
@@ -565,6 +614,9 @@ def run_conversation(
     # Track memory nudge trigger (turn-based, checked here).
     # Skill trigger is checked AFTER the agent loop completes, based on
     # how many tool iterations THIS turn used.
+    # 中文·记忆 nudge（纯代码节流）：每 _memory_nudge_interval 个用户轮次置位一次，
+    # 本轮响应发出后再据此 spawn 后台 LLM 审查（见文件末尾 _spawn_background_review）。
+    # 这里只数数和判定，"该不该真去存"留给那个 fork 的 LLM agent 决定。
     _should_review_memory = False
     if (agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
@@ -595,11 +647,18 @@ def run_conversation(
     # from disk that the model already knows about (it wrote them!),
     # producing a different system prompt and breaking the Anthropic
     # prefix cache.
+    # 中文·【阶段③ 装配 system prompt + 落盘 + 预压缩 + 插件 hook】
+    #   · 只在「首轮 / DB 存档为空或损坏」时才真正 build；继续会话（gateway 每轮新建 agent）
+    #     直接复用 DB 里存的上轮 prompt，逐字节一致 → 命中 Anthropic prefix 缓存。压缩后由
+    #     invalidate_system_prompt 置空缓存、触发重建。
+    #   · 随后还有三步（见下方各注释）：崩溃落盘 inbound user turn → 进循环前预压缩 → pre_llm_call hook。
     if agent._cached_system_prompt is None:
         _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     active_system_prompt = agent._cached_system_prompt
 
+    # 中文·崩溃落盘：拿到有效 system prompt 后立刻把 inbound user turn 写盘——赶在任何
+    # provider 调用 / 工具执行可能 hang 或 kill 进程之前；_last_flushed_db_idx 保证幂等、不重复写行。
     # Crash-resilience: persist the inbound user turn as soon as the session row
     # has a valid system prompt, before any provider call or tool execution can
     # hang/kill the process. The normal end-of-turn persist still runs later;
@@ -613,6 +672,9 @@ def run_conversation(
             exc_info=True,
         )
 
+    # 中文·进主循环前的【预压缩】：若加载的 history 已超模型上下文阈值（常见于中途换成小
+    # 窗口模型），主动压缩而不是等 API 报错（4xx 可能不可重试、直接中断请求）；超大会话可能
+    # 压多趟（最多 3 趟，每趟摘要中间 N 轮）。
     # ── Preflight context compression ──
     # Before entering the main loop, check if the loaded conversation
     # history already exceeds the model's context threshold.  This handles
@@ -720,6 +782,8 @@ def run_conversation(
                 if not _compressor.should_compress(_preflight_tokens):
                     break  # Under threshold or anti-thrash guard stopped it
 
+    # 中文·pre_llm_call 插件 hook：插件可返回 context，注入到 user 消息（绝不进 system
+    # prompt——保 prefix 缓存前缀稳定）；注入内容 ephemeral，不落 session DB。
     # Plugin hook: pre_llm_call
     # Fired once per turn before the tool-calling loop.  Plugins can
     # return a dict with a ``context`` key (or a plain string) whose
@@ -794,12 +858,20 @@ def run_conversation(
         agent._interrupt_message = None
         agent._interrupt_thread_signal_pending = False
 
+    # 中文·【阶段④ 外部召回】（仅当配了外部 memory provider）：
+    #   · on_turn_start(轮次, 消息)  通知 provider 新一轮——必须在 prefetch 之前，让其按
+    #                                contextCadence/dialecticCadence 节奏决定是否刷新
+    #   · prefetch_all(query)        取一次召回并缓存到 _ext_prefetch_cache，整轮复用（避免每次
+    #                                工具调用都重召回 = N 倍延迟+成本）；query 用干净的
+    #                                original_user_message；召回在阶段⑤ 每轮 ephemeral 注入 user 副本
+    #   · 旁路：api_mode==codex_app_server 时整轮交给 Codex 子进程，跳过下面的默认工具循环
     # Notify memory providers of the new turn so cadence tracking works.
     # Must happen BEFORE prefetch_all() so providers know which turn it is
     # and can gate context/dialectic refresh via contextCadence/dialecticCadence.
     if agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
+            # 中文：通知外部 memory provider 新一轮对话开始（用于召回节奏/计数）。
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
         except Exception:
             pass
@@ -813,6 +885,7 @@ def run_conversation(
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
+            # 中文：每轮取一次外部召回并缓存；_query 用干净的 original_user_message（避免被注入内容污染）。
             _ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass
@@ -831,6 +904,17 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    # 中文·【阶段⑤ 工具循环】while 主循环，每次迭代（iteration）= 一次模型调用 + 一批工具分发，
+    # 是 turn 内的最小执行单元；受 max_iterations 与 iteration_budget 双重限额。每轮迭代依次：
+    #   a) 检查用户中断 / 消耗预算（耗尽则给一次 grace call 后退出）
+    #   b) step_callback 通知 gateway（agent:step 事件）；skill nudge 计数 +1
+    #   c) /steer 引流：把上次 API 期间到达的 steer 追加进最近一条 tool 消息，让模型本轮即可见
+    #   d) 清洗 tool_call 参数 + 修复 role 交替违规（防空响应死循环）
+    #   e) 构造 api_messages 副本，把外部召回 + 插件 context ephemeral 注入到本轮 user 副本
+    #      （原始 messages 不动 → 不落库、不进 trajectory、不破 system prompt 缓存前缀）
+    #   f) 组装最终 system 串（冻结快照逐字节复用）→ 调模型（_interruptible_api_call，可中断）
+    #   g) 解析响应：有 tool_calls → 分发工具、回填结果、继续循环；无 → 设 final_response 跳出
+    #   h) 异常分支：空响应 / 非法工具 / 上下文超限 等各自重试或触发压缩
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
@@ -893,6 +977,12 @@ def run_conversation(
             agent._iters_since_skill += 1
         
         # ── Pre-API-call /steer drain ──────────────────────────────────
+        # 中文·【发请求前 /steer 引流】做什么：把上一次模型思考期间用户发来的 /steer（暂存在
+        # _pending_steer）取出，注入到「最近一条 tool 消息」末尾。背景：/steer 是不打断模型的中途引导；
+        # 若不在此处注入，它要等下一批工具结果才生效，而模型若直接给最终回复就再无下一批 → 引导丢失。
+        # 怎么做：倒序找最后一条 role:"tool" 消息，把 steer marker 追加进去（字符串直接拼、多模态则加 text 块）；
+        # 找不到（首轮、还没工具结果）就线程安全放回 _pending_steer 等之后的引流——往 user 消息插会破坏 role 交替。
+        # 效果：用户中途引导本轮即被模型看到、可立刻纠偏；无处可挂时安全回排，不丢失也不乱序。
         # If a /steer arrived during the previous API call (while the model
         # was thinking), drain it now — before we build api_messages — so
         # the model sees the steer text on THIS iteration.  Without this,
@@ -986,6 +1076,9 @@ def run_conversation(
             # API-call-time only — the original message in `messages` is
             # never mutated, so nothing leaks into session persistence.
             if idx == current_turn_user_idx and msg.get("role") == "user":
+                # 中文·召回注入（ephemeral，纯代码）：把外部 provider 的召回结果 fence 后
+                # 追加到"本轮 user 消息的副本"上，只在这次 API 请求里存在；原始 messages
+                # 不变，因此不落 session DB、不进 trajectory。每轮只注入一次缓存好的召回。
                 _injections = []
                 if _ext_prefetch_cache:
                     _fenced = build_memory_context_block(_ext_prefetch_cache)
@@ -1021,6 +1114,10 @@ def run_conversation(
             # The signature field helps maintain reasoning continuity
             api_messages.append(api_msg)
 
+        # 中文·【组装最终 system 串】做什么：把整轮稳定的冻结快照 active_system_prompt 与（可选的）
+        # ephemeral_system_prompt 拼成一条 system 消息放在最前。背景：Hermes 不变式——system prompt 每
+        # session 只 build 一次、逐字节复用；召回/插件都注进 user 而非这里。效果：system 字节稳定 →
+        # 上游 prefix 缓存常热；ephemeral 部分只在本次请求临时加、不落 session DB。
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
         # External recall context is injected into the user message, not the system
@@ -1042,6 +1139,8 @@ def run_conversation(
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
+        # 中文·【插入少样本 prefill】做什么：把 prefill_messages（few-shot 示例对）插在 system 之后、
+        # 历史之前。背景/效果：仅 API 调用时注入、不落库；用于给模型贴示例引导，又不污染持久历史。
         # Inject ephemeral prefill messages right after the system prompt
         # but before conversation history. Same API-call-time-only pattern.
         if agent.prefill_messages:
@@ -1049,6 +1148,9 @@ def run_conversation(
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
 
+        # 中文·【打 Anthropic 缓存断点】做什么：对 Claude（native / OpenRouter / 兼容网关）在 system +
+        # 最后几条消息上加 cache_control:ephemeral 断点。背景：多轮对话重复前缀很大。效果：命中 prefix
+        # 缓存，输入 token 成本约降 75%。
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible
         # gateways. Auto-detected: if ``_use_prompt_caching`` is set,
@@ -1062,12 +1164,18 @@ def run_conversation(
                 native_anthropic=agent._use_native_cache_layout,
             )
 
+        # 中文·【孤儿 tool 结果兜底】做什么：清掉没有配对 assistant 的孤立 tool 结果、或给缺失结果补桩。
+        # 背景：会话加载或手动改消息可能留下 tool→? 的非法序列；这里无条件跑（不依赖压缩开关）。
+        # 效果：保证发给 API 的消息序列合法，避免被判非法序列而 400 进而触发无谓重试。
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
         # gated on context_compressor — so orphans from session loading or
         # manual message manipulation are always caught.
         api_messages = agent._sanitize_api_messages(api_messages)
 
+        # 中文·【丢弃只有思维块的 assistant 轮】做什么：删掉"有 reasoning 但无可见输出、也无 tool_calls"
+        # 的 assistant 轮，并合并相邻 user。背景：Anthropic 及兼容网关无法回放"以 thinking 结尾"的 assistant
+        # 轮（400）。效果：只改 API 副本（历史仍保留 reasoning 供 UI/持久化），规避该类 400。
         # Drop thinking-only assistant turns (reasoning but no visible
         # output and no tool_calls) and merge any adjacent user messages
         # left behind. Prevents Anthropic 400s ("The final block in an
@@ -1078,6 +1186,10 @@ def run_conversation(
         # UI transcript and session persistence.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
 
+        # 中文·【归一化消息以稳定前缀】做什么：strip 文本空白 + 把 tool_call 的 arguments 重新序列化为
+        # 无空格、键排序（sort_keys）的 JSON。背景：本地推理服务器（llama.cpp/vLLM/Ollama）按字节匹配
+        # 前缀做 KV 缓存，参数序非确定就破前缀。效果：跨轮字节级一致 → 本地命中 KV、云端缓存命中率更高；
+        # 只动 api_messages 副本，不碰原 messages。
         # Normalize message whitespace and tool-call JSON for consistent
         # prefix matching.  Ensures bit-perfect prefixes across turns,
         # which enables KV cache reuse on local inference servers
@@ -1124,6 +1236,9 @@ def run_conversation(
             api_messages, tools=agent.tools or None
         )
 
+        # 中文·发请求前的体量估算与守卫：算 messages + tool schema 的粗略 token 数；若本地
+        # Ollama 运行时上下文窗口装不下（工具占用大），直接定稿失败并退款本次迭代预算，
+        # 不白发一次注定失败的请求。
         _runtime_context_error = _ollama_context_limit_error(
             agent, approx_request_tokens
         )
@@ -1195,6 +1310,11 @@ def run_conversation(
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
+        # ══ 内层重试子循环 ══：把"这一次模型调用"包在 provider 专属的恢复逻辑里。一次 API
+        # 调用可能因 限流(429) / 鉴权过期 / 上下文超限 / provider 故障 等失败；下面据错误类型
+        # 分别处理：限流退避、刷新 token、压缩后重试、切 fallback provider……成功拿到响应才跳出
+        # 本子循环；retry_count 用尽则定稿为错误回复。注意它与外层工具循环（阶段⑤）是两层：
+        # 外层"模型↔工具"轮次，内层"一次调用的重试"。
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
@@ -1394,6 +1514,9 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
+                # 中文·真正发起这次模型调用：默认走【流式】路径（即使无显示消费者也用流式，以获得
+                # 90s 卡流检测 / 60s 读超时的健康检查，避免 SSE 假活挂死）；经 run_llm_execution_
+                # middleware 包一层中间件，内部最终调 _interruptible_streaming_api_call / _interruptible_api_call。
                 response = run_llm_execution_middleware(
                     api_kwargs,
                     _perform_api_call,
@@ -1429,6 +1552,9 @@ def run_conversation(
                     resp_model = getattr(response, 'model', 'N/A') if response else 'N/A'
                     logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
                 
+                # 中文·校验响应形状；下方一大段（直到重试子循环末）是【provider 专属错误恢复】：
+                # codex/anthropic/nous/copilot 鉴权重试、429 退避、finish_reason=="length" 截断续写、
+                # 思维签名/加密内容/图片过大/多模态内容 等各类可恢复错误，分别 retry / 压缩 / 切 fallback。
                 # Validate response shape before proceeding
                 response_invalid = False
                 error_details = []
@@ -3630,6 +3756,8 @@ def run_conversation(
             _turn_exit_reason = "interrupted_during_api_call"
             break
 
+        # 中文·重试子循环退出后：若期间触发了"压缩后重启"，用压缩过的 messages 重置重试状态、
+        # 回到外层工具循环顶部重新构造请求（而不是拿超长上下文继续撞墙）。
         if restart_with_compressed_messages:
             api_call_count -= 1
             agent.iteration_budget.refund()
@@ -4021,8 +4149,14 @@ def run_conversation(
                     assistant_message.tool_calls
                 )
 
+                # 中文·【解析模型响应 → 有工具调用分支】把响应组装成 assistant 消息。若本轮同时带
+                # 正文+工具调用（常见：模型给完答案又顺手调 memory/skill），把正文存为兜底 final_response；
+                # 随后追加 assistant 消息、逐个执行工具并回填 tool 结果、按需压缩，continue 回循环顶进入下一迭代。
                 assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
-                
+
+                # 中文·【正文+工具调用同回合 → 存兜底正文】做什么：若本轮模型既给了正文又调了工具
+                # （常见：答完顺手存 memory/skill），把正文存进 _last_content_with_tools。背景：工具执行后
+                # 模型若空响应就没正文可回。效果：拿这份正文当兜底最终回复，避免"已答完却显示空"。
                 # If this turn has both content AND tool_calls, capture the content
                 # as a fallback final response. Common pattern: model delivers its
                 # answer and calls memory/skill tools as a side-effect in the same
@@ -4076,6 +4210,8 @@ def run_conversation(
                 # a LATER tool round.
                 agent._post_tool_empty_retried = False
 
+                # 中文·把模型这一回合（assistant 消息，含 tool_calls + 可选正文）追加进历史，并发出
+                # interim 消息供 UI/SSE 展示——它必须先于工具结果入列，保证 assistant→tool 的合法序列。
                 messages.append(assistant_msg)
                 agent._emit_interim_assistant_message(assistant_msg)
 
@@ -4091,6 +4227,9 @@ def run_conversation(
                     except Exception:
                         pass
 
+                # 中文·★语义核心：逐个执行模型请求的工具。_execute_tool_calls 内部对每个 tool_call 经
+                # tool_executor.handle_function_call 分发到对应实现（memory/terminal/search/…），把每个
+                # 结果以 role:"tool" 追加进 messages；这些 tool 结果就是下一轮迭代喂回模型的输入。
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if agent._tool_guardrail_halt_decision is not None:
@@ -4129,6 +4268,9 @@ def run_conversation(
                 # arrives.
                 agent._stream_needs_break = True
 
+                # 中文·【execute_code 退还迭代】做什么：若本轮唯一调用的工具是 execute_code（程序化工具
+                # 调用），退还一次 iteration_budget。背景/效果：这类 RPC 式廉价调用不该吃掉迭代预算，
+                # 把额度留给真正的"模型决策"轮次。
                 # Refund the iteration if the ONLY tool(s) called were
                 # execute_code (programmatic tool calling).  These are
                 # cheap RPC-style calls that shouldn't eat the budget.
@@ -4172,6 +4314,8 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
+                # 中文·工具结果回填后，用 API 上报的【真实 prompt token 数】判断是否压缩上下文（超阈值
+                # 则就地摘要中间轮次、腾出窗口）；真实用量比粗估更准，避免过早/过晚压缩。
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
                     messages, active_system_prompt = agent._compress_context(
@@ -4187,10 +4331,14 @@ def run_conversation(
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
                 
+                # 中文·本轮"模型→工具→结果"闭环已完成，continue 回到 while 顶部：下一次迭代模型会
+                # 看到刚回填的 tool 结果，据此继续（再调工具，或不调工具→给出最终回复进入下面 else 分支）。
                 # Continue loop for next response
                 continue
             
             else:
+                # 中文·【无工具调用分支 = 本轮定稿】模型不再调工具 → 这就是最终回复，设 final_response
+                # 并 break 跳出工具循环；分支内还含空响应/截断/思维块剥离/部分流恢复等多重兜底。
                 # No tool calls - this is the final response
                 final_response = assistant_message.content or ""
                 
@@ -4600,6 +4748,8 @@ def run_conversation(
                 f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
                 "— requesting summary..."
             )
+        # 中文·循环兜底：跑满 max_iterations 仍没拿到"无工具调用"的最终回复时，由
+        # _handle_max_iterations 生成一个收尾回复（防无限循环，对应阶段⑤ 的迭代上限）。
         final_response = agent._handle_max_iterations(messages, api_call_count)
 
         # If running as a kanban worker, signal the dispatcher that the
@@ -4913,7 +5063,12 @@ def run_conversation(
         _should_review_skills = True
         agent._iters_since_skill = 0
 
+    # 中文·【阶段⑥ 收尾·下半】（上方已先判定 _should_review_skills）按序：
+    #   · _sync_external_memory_for_turn：把本轮交流同步进外部 memory + 预约下一轮召回
+    #   · 若有最终回复、未中断、且 memory/skill nudge 命中 → _spawn_background_review fork 后台审查
+    #   · on_session_end 插件 hook（每轮都触发，不是整段会话结束）→ return result
     # External memory provider: sync the completed turn + queue next prefetch.
+    # 中文：本轮结束后把这次交流同步进外部 memory，并预约下一轮的召回。
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message,
         final_response=final_response,
@@ -4925,6 +5080,7 @@ def run_conversation(
     # so it never competes with the user's task for model attention.
     if final_response and not interrupted and (_should_review_memory or _should_review_skills):
         try:
+            # 中文：memory nudge 命中后，spawn 一个后台 LLM 审查任务（异步、尽力而为）。
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=_should_review_memory,

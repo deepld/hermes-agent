@@ -19,6 +19,27 @@ Usage:
     provider = load_memory_provider("mnemosyne")  # MemoryProvider instance
 """
 
+# ═════════════════════════════════════════════════════════════════════════════
+# 【中文导读】外部记忆 Provider 的「发现与加载」——独立于通用 PluginManager 的发现系统
+# ═════════════════════════════════════════════════════════════════════════════
+# 为什么自成一套、不走 hermes_cli/plugins.py 的通用 PluginManager？三个硬约束：
+#   1) 同一时刻只能有一个外部 provider（由 memory.provider 配置选中），不像通用插件无上限；
+#   2) CLI 命令【懒加载】：只为 active provider 加载它的 cli.py，禁用的 provider 不污染
+#      `hermes --help`（见 discover_plugin_cli_commands）；
+#   3) 用户插件用合成命名空间 `_hermes_user_memory` 隔离，避免和 bundled 同名在 sys.modules 撞车。
+#
+# 扫描顺序（_iter_provider_dirs / find_provider_dir）：
+#   bundled 先（plugins/memory/<name>/）→ 用户安装后（$HERMES_HOME/plugins/<name>/）；
+#   同名冲突 bundled 胜。用户目录还要先过 _is_memory_provider_dir 文本嗅探，跳过非记忆插件。
+#
+# 加载机制（_load_provider_from_dir）：先按 import 注册父包 / 子模块让相对导入
+#   (`from .store import X`) 能解析，exec_module 后优先用 register(ctx) 模式
+#   （由 _ProviderCollector 捕获 provider 实例），回退到"找 MemoryProvider 子类直接实例化"。
+#
+# 调用入口：agent_init.py 用 load_memory_provider(name) 拿实例 → MemoryManager.add_provider；
+#   `hermes memory` 安装向导用 discover_memory_providers() 列可选项。全程纯代码、无 LLM。
+# ═════════════════════════════════════════════════════════════════════════════
+
 from __future__ import annotations
 
 import importlib

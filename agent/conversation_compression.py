@@ -426,6 +426,8 @@ def compress_context(
                 logger.debug("compression lock release failed: %s", _rel_err)
 
     # Notify external memory provider before compression discards context
+    # 中文·压缩抢救路径：旧消息即将被摘要并丢弃前，给 provider 最后一次机会抽取洞察；
+    # 返回文本会并入压缩 summary，避免有价值的信息随上下文压缩一起蒸发。
     if agent._memory_manager:
         try:
             agent._memory_manager.on_pre_compress(messages)

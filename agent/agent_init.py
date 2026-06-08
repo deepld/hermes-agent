@@ -1100,6 +1100,9 @@ def init_agent(
     agent._aux_compression_context_length_config = None
 
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
+    # 中文·启动接线（下面这段）：① 读 config 建 MemoryStore 并 load_from_disk 冻结快照；
+    # ② 若 config 指定了 memory.provider，再加载唯一的外部 provider 并 initialize_all；
+    # ③ 把 provider 的工具 schema 注入工具面。skip_memory=True（如后台审查 fork）会跳过②。
     agent._memory_store = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
@@ -1126,6 +1129,8 @@ def init_agent(
 
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
+    # 中文·provider 加载块：按 config 的 memory.provider 名加载唯一外部插件，
+    # 可用则 add_provider，再带上 session/user/chat 等作用域信息 initialize_all 完成激活。
     agent._memory_manager = None
     if not skip_memory:
         try:
@@ -1212,6 +1217,8 @@ def init_agent(
             for t in agent.tools
             if isinstance(t, dict)
         }
+        # 中文·provider 工具注入块：把外部 provider 暴露的工具 schema 包装后追加进工具面，
+        # 跳过已存在的同名工具，并登记到 valid_tool_names 供后续校验放行。
         for _schema in agent._memory_manager.get_all_tool_schemas():
             _tname = _schema.get("name", "")
             if _tname and _tname in _existing_tool_names:

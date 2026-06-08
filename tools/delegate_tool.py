@@ -2264,6 +2264,9 @@ def delegate_task(
         results.sort(key=lambda r: r["task_index"])
 
     # Notify parent's memory provider of delegation outcomes
+    # 中文·委派观察路径：子 agent 自身 skip_memory=True（无记忆 session，见上方 1159 行），
+    # 因此由【父 agent】的 provider 通过 on_delegation 记录"委派了什么 + 子 agent 返回了什么"，
+    # 作为父侧的一条观察。每条结果独立 try/except，单条失败不影响其余委派的回写。
     if (
         parent_agent
         and hasattr(parent_agent, "_memory_manager")
